@@ -5,7 +5,8 @@ import { MongoClient, ObjectId } from "mongodb";
 import { SYSTEM } from "./src/prompt.js";
 import { polish } from "./src/polish.js";
 
-for (const k of ["GEMINI_API_KEY", "MONGODB_URI"]) if (!process.env[k]) throw new Error(`Missing ${k} in environment`);
+const OPENAI_STYLE = !!process.env.LLM_BASE_URL; // Groq, OpenRouter, or any OpenAI-compatible API
+for (const k of OPENAI_STYLE ? ["LLM_API_KEY", "LLM_MODEL", "MONGODB_URI"] : ["GEMINI_API_KEY", "MONGODB_URI"]) if (!process.env[k]) throw new Error(`Missing ${k} in environment`);
 
 const mongo = new MongoClient(process.env.MONGODB_URI);
 await mongo.connect();
@@ -21,9 +22,30 @@ app.use(express.json({ limit: "200kb" }));
 app.use(express.static("public"));
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: e.message }); });
 
-// ---- Gemini ----
-async function askGemini(user) {
-  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// ---- LLM (Gemini or OpenAI-compatible) ----
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function callOpenAIStyle(model, user) {
+  const body = { model, temperature: 0.7, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }] };
+  if (process.env.LLM_JSON_MODE !== "off") body.response_format = { type: "json_object" };
+  const r = await fetch(`${process.env.LLM_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.LLM_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const e = new Error(`LLM ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    e.retryable = [429, 500, 502, 503, 504].includes(r.status);
+    throw e;
+  }
+  const j = await r.json();
+  const text = j.choices?.[0]?.message?.content ?? "";
+  const m = text.match(/\{[\s\S]*\}/); // tolerate models that wrap JSON in prose or code fences
+  return JSON.parse(m ? m[0] : text);
+}
+
+async function callModel(model, user) {
+  if (OPENAI_STYLE) return callOpenAIStyle(model, user);
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
@@ -33,10 +55,32 @@ async function askGemini(user) {
       generationConfig: { responseMimeType: "application/json", temperature: 0.7 },
     }),
   });
-  if (!r.ok) throw new Error(`Gemini ${r.status}: ${(await r.text()).slice(0, 300)}`);
+  if (!r.ok) {
+    const e = new Error(`Gemini ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    e.retryable = [429, 500, 503, 504].includes(r.status);
+    throw e;
+  }
   const j = await r.json();
   const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
   return JSON.parse(text.replace(/^```json|```$/g, "").trim());
+}
+
+// Retries busy/overloaded errors (503, 429) with a short backoff, then tries the fallback model if one is set.
+async function askGemini(user) {
+  const models = (OPENAI_STYLE ? [process.env.LLM_MODEL, process.env.LLM_FALLBACK_MODEL] : [process.env.GEMINI_MODEL || "gemini-3.5-flash-lite", process.env.GEMINI_FALLBACK_MODEL]).filter(Boolean);
+  let lastErr;
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await callModel(model, user);
+      } catch (e) {
+        lastErr = e;
+        if (!e.retryable && !(e instanceof SyntaxError)) throw e;
+        await sleep(1500 * (attempt + 1));
+      }
+    }
+  }
+  throw new Error(lastErr?.retryable ? "The AI model is overloaded right now. Try again in a minute." : lastErr.message);
 }
 
 // ---- simple per-IP rate limit (20 generations / minute) ----
